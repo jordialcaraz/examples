@@ -26,5 +26,15 @@ Each example is built in its own subdirectory under the main build directory (if
 
 ## Issue with codeCoverage
 
-$ cd codeCoverage
-$ ./code_coverage -s lib_to_instrument/libtorch_python.so libtorch_python.so
+When writing the instrumented library, it show a segmentation fault:
+	$ Library instrumented, writing...
+	$ Segmentation fault (core dumped)
+
+
+
+How to reproduce
+	$ cd codeCoverage
+	$ ./code_coverage -s lib_to_instrument/libtorch_python.so libtorch_python.so
+
+
+

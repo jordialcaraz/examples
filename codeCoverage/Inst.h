@@ -14,3 +14,5 @@ LIB_EXPORT void registerBB(int, char const*, char const*, unsigned long);
 LIB_EXPORT void incFuncCoverage(int);
 LIB_EXPORT void incBBCoverage(int);
 LIB_EXPORT void exitCoverage(int, int, int);
+LIB_EXPORT void FEntryCoverage(const char * func_name);
+LIB_EXPORT void FExitCoverage(const char * func_name);

@@ -32,26 +32,22 @@ using namespace std;
 
 using namespace Dyninst;
 
-static const char* USAGE = " [-bpsa] <binary> <output binary>\n \
-                            -b: Basic block level code coverage\n \
-                            -p: Print all functions (including functions that are never executed)\n \
-                            -s: Instrument shared libraries also\n \
-                            -a: Sort results alphabetically by function name\n";
+#define MUTNAMELEN 1024
+#define FUNCNAMELEN 32*1024
+#define NO_ERROR -1
+#define dprintf printf
 
-static const char* OPT_STR = "bpsa";
+BPatch *bpatch;
+
+static const char* USAGE = " -s <shared library> <output shared library\n";
+
+static const char* OPT_STR = "s";
 
 // configuration options
-char const* inBinary = NULL;
-char const* outBinary = NULL;
-bool includeSharedLib = false;
-int printAll = 0;
-bool bbCoverage = false;
-int alphabetical = 0;
+char const* mutateeName = NULL;
+char const* outfile = NULL;
 
 set<string> skipLibraries;
-
-/* Every Dyninst mutator needs to declare one instance of BPatch */
-BPatch bpatch;
 
 void initSkipLibraries() {
   /* List of shared libraries to skip instrumenting */
@@ -74,14 +70,11 @@ bool parseArgs(int argc, char* argv[]) {
   int c;
   while((c = getopt(argc, argv, OPT_STR)) != -1) {
     switch((char)c) {
-      case 'b': bbCoverage = true; break;
-      case 'p': printAll = 1; break;
       case 's':
         /* if includeSharedLib is set,
          * all libraries linked to the binary will also be instrumented */
-        includeSharedLib = true;
+        //includeSharedLib = true;
         break;
-      case 'a': alphabetical = 1; break;
       default: cerr << "Usage: " << argv[0] << USAGE; return false;
     }
   }
@@ -93,7 +86,7 @@ bool parseArgs(int argc, char* argv[]) {
     return false;
   }
   /* Input Binary */
-  inBinary = argv[endArgs];
+  mutateeName = argv[endArgs];
 
   endArgs++;
   if(endArgs >= argc) {
@@ -102,305 +95,154 @@ bool parseArgs(int argc, char* argv[]) {
   }
 
   /* Rewritten Binary */
-  outBinary = argv[endArgs];
-
+  outfile = argv[endArgs];
+  printf("Instrumenting %s , output %s\n", mutateeName, outfile);
   return true;
 }
 
-BPatch_function* findFuncByName(BPatch_image* appImage, char const* funcName) {
-  /* fundFunctions returns a list of all functions with the name 'funcName' in
-   * the binary */
-  BPatch_Vector<BPatch_function*> funcs;
-  if(NULL == appImage->findFunction(funcName, funcs) || !funcs.size() || NULL == funcs[0]) {
-    cerr << "Failed to find " << funcName << " function in the instrumentation library" << endl;
+BPatch_function * tauFindFunction (BPatch_image *appImage, const char * functionName)
+{
+  // Extract the vector of functions 
+  BPatch_Vector<BPatch_function *> found_funcs;
+  if ((NULL == appImage->findFunction(functionName, found_funcs, false, true, true)) || !found_funcs.size()) {
+    dprintf("tau_run: Unable to find function %s\n", functionName); 
     return NULL;
   }
-  return funcs[0];
+  return found_funcs[0]; // return the first function found 
+  // FOR DYNINST 3.0 and previous versions:
+  // return appImage->findFunction(functionName);
 }
 
-bool insertFuncEntry(BPatch_binaryEdit* appBin, BPatch_function* curFunc, char const* funcName,
-                     BPatch_function* instIncFunc, int funcId) {
-  /* Find the instrumentation points */
-  vector<BPatch_point*>* funcEntry = curFunc->findPoint(BPatch_entry);
-  if(NULL == funcEntry) {
-    cerr << "Failed to find entry for function " << funcName << endl;
-    return false;
+
+//Only instruments the input library
+int tauRewriteLibrary(BPatch *bpatch)
+{
+  using namespace std;
+  dprintf("Inside tauRewriteLibrary, name=%s, out=%s\n", mutateeName, outfile);
+
+  BPatch_binaryEdit* mutateeAddressSpace = bpatch->openBinary(mutateeName, false);
+
+  if( mutateeAddressSpace == NULL ) {
+    fprintf(stderr, "Failed to open binary %s\n",
+           mutateeName);
+    return -1;
   }
 
-  cout << "Inserting instrumention at function entry of " << funcName << endl;
-  /* Create a vector of arguments to the function
-   * incCoverage function takes the function name as argument */
-  BPatch_Vector<BPatch_snippet*> instArgs;
-  BPatch_constExpr id(funcId);
-  instArgs.push_back(&id);
-  BPatch_funcCallExpr instIncExpr(*instIncFunc, instArgs);
-
-  /* Insert the snippet at function entry */
-  BPatchSnippetHandle* handle =
-      appBin->insertSnippet(instIncExpr, *funcEntry, BPatch_callBefore, BPatch_lastSnippet);
-  if(!handle) {
-    cerr << "Failed to insert instrumention at function entry of " << funcName << endl;
-    return false;
+  const char* instLibrary = "libInst.so";
+  bool result = mutateeAddressSpace->loadLibrary(instLibrary);
+  if (!result) {
+    printf("Error: loadLibrary(%s) failed. Please ensure that TAU's lib directory is in your LD_LIBRARY_PATH environment variable and retry.\n", instLibrary);
+    printf("You may also want to use tau_exec while launching the rewritten binary. If TAU relies on some external libraries (Score-P), these may need to specified as tau_exec -loadlib=/path/to/library <mutatee> \n");
   }
-  return true;
-}
+  assert(result);
 
-bool insertBBEntry(BPatch_binaryEdit* appBin, BPatch_function* curFunc, char const* funcName,
-                   char const* moduleName, BPatch_function* instBBIncFunc, BPatch_function* registerBB,
-                   int* bbIndex, BPatch_Vector<BPatch_snippet*>* registerCalls) {
-  BPatch_flowGraph* appCFG = curFunc->getCFG();
-  BPatch_Set<BPatch_basicBlock*> allBlocks;
-  BPatch_Set<BPatch_basicBlock*>::iterator iter;
-  if(!appCFG) {
-    cerr << "Failed to find CFG for function " << funcName << endl;
-    return EXIT_FAILURE;
-  }
-  if(!appCFG->getAllBasicBlocks(allBlocks)) {
-    cerr << "Failed to find basic blocks for function " << funcName << endl;
-    return EXIT_FAILURE;
-  } else if(allBlocks.size() == 0) {
-    cerr << "No basic blocks for function " << funcName << endl;
-    return EXIT_FAILURE;
+  BPatch_image* mutateeImage = mutateeAddressSpace->getImage();
+
+
+
+  //As libraries do not have main, instrumentation is only inserted into
+  //the entry and exit of function calls, tau_exec, or a program compiled with 
+  //TAU, is necessary to initialize TAU
+  //tau_trace_lib_entry uses TAU_START, tau_trace_lib_exist uses TAU_STOP
+  dprintf("Searching for TAU functions\n");
+  BPatch_function* entryLibTrace = tauFindFunction(mutateeImage, "FEntryCoverage");
+  BPatch_function* exitLibTrace = tauFindFunction(mutateeImage, "FExitCoverage");
+
+  if(!entryLibTrace || !exitLibTrace )
+  {
+    fprintf(stderr, "Couldn't find TAU hook functions, aborting\n");
+    return -1;
   }
 
-  /* Instrument the entry of every basic block */
+  //Get the different modules, which will be the monitoring library(tau) and
+  //the library where we want to insert instrumentation
+  dprintf("Getting modules \n");
+  vector<BPatch_module *> *modules = mutateeImage->getModules();
+  vector<BPatch_module *>::iterator moduleIter;
 
-  for(iter = allBlocks.begin(); iter != allBlocks.end(); iter++) {
-    unsigned long address = (*iter)->getStartAddress();
-    cout << "Instrumenting Basic Block 0x" << hex << address << " of " << funcName << endl;
-    BPatch_Vector<BPatch_snippet*> instArgs;
-    BPatch_constExpr bbId(*bbIndex);
-    instArgs.push_back(&bbId);
-    BPatch_point* bbEntry = (*iter)->findEntryPoint();
-    if(NULL == bbEntry) {
-      cerr << "Failed to find entry for basic block at 0x" << hex << address << endl;
-      return false;
+  //Get only the name of the library from mutateeName, as we can be selecting the
+  //library from its original path, but the module only shows the library name
+  string libpath(mutateeName);
+  string mutateefilename = libpath.substr(libpath.find_last_of("/\\") + 1);
+
+  //Iterate between the different modules and only insert instrumentation into
+  //the desired library
+  for (moduleIter = modules->begin(); moduleIter != modules->end();
+       ++moduleIter) 
+  {
+    char moduleName[1024];
+    (*moduleIter)->getName(moduleName, 1024);
+    dprintf("module %s, mutatee %s \n", moduleName, mutateefilename.c_str());
+
+	  string module_str = moduleName;
+    if( strcmp(module_str.substr(module_str.find_last_of("/\\") + 1).c_str(), mutateefilename.c_str())!=0)
+    {
+        dprintf("Skipping module!\n");
+        continue;
     }
-    BPatch_funcCallExpr instIncExpr(*instBBIncFunc, instArgs);
-    BPatchSnippetHandle* handle =
-        appBin->insertSnippet(instIncExpr, *bbEntry, BPatch_callBefore, BPatch_lastSnippet);
-    if(!handle) {
-      cerr << "Failed to insert instrumention in basic block at 0x" << hex << address << endl;
-      return false;
+    if(!(*moduleIter)->isSharedLib()) {
+      printf("Module to instrument is not a shared library, cannot instrument\n");
+      return -1;
     }
 
-    /* Create a call to the registration function for this basic block */
-    BPatch_Vector<BPatch_snippet*> regArgs;
-    BPatch_constExpr bbIdReg(*bbIndex);
-    regArgs.push_back(&bbIdReg);
-    BPatch_constExpr coverageFunc(funcName);
-    regArgs.push_back(&coverageFunc);
-    BPatch_constExpr coverageModule(moduleName);
-    regArgs.push_back(&coverageModule);
-    BPatch_constExpr addrArg(address);
-    regArgs.push_back(&addrArg);
+    dprintf("Instrumenting module\n");
 
-    BPatch_funcCallExpr* regCall = new BPatch_funcCallExpr(*registerBB, regArgs);
-    registerCalls->push_back(regCall);
+    vector<BPatch_function *> *allFunctions = (*moduleIter)->getProcedures();
+    vector<BPatch_function *>::iterator funcIter;
 
-    (*bbIndex)++;
+    //Iterate between the different function in the library
+    for (funcIter = allFunctions->begin(); funcIter != allFunctions->end();
+         ++funcIter) 
+    {
+      char funcName[1024];
+      BPatch_function *curFunc = *funcIter;
+      curFunc->getName(funcName, 1024);
+
+      dprintf("Instrumenting Function %s\n", funcName);
+
+      //Find the entry and exit points of each function
+      BPatch_Vector<BPatch_point*>* funcEntry = curFunc->findPoint(BPatch_entry);
+      BPatch_Vector<BPatch_point*>* funcExit = curFunc->findPoint(BPatch_exit);
+
+      //TAU_START and TAU_STOP need the name of the function, pass it as an argument
+      BPatch_Vector<BPatch_snippet *> regArgs;
+      BPatch_constExpr coverageFunc(funcName);
+      regArgs.push_back(&coverageFunc);
+
+      //Create the function calls with the names of the functions as the input parameter
+      BPatch_funcCallExpr entryTrace(*entryLibTrace, regArgs);
+      BPatch_funcCallExpr exitTrace(*exitLibTrace, regArgs);
+
+      //Insert the snippets to monitor the function calls
+      BPatchSnippetHandle* handle_a = mutateeAddressSpace->insertSnippet(entryTrace, *funcEntry, BPatch_callBefore, BPatch_lastSnippet);
+      BPatchSnippetHandle* handle_b = mutateeAddressSpace->insertSnippet(exitTrace, *funcExit, BPatch_callAfter, BPatch_lastSnippet);
+      if(!handle_a)
+      {
+        printf("Failed to insert instrumentation at function entry of %s", funcName);
+        return -1;
+      }
+      if(!handle_b)
+      {
+        printf("Failed to insert instrumentation at function exit of %s", funcName);
+        return -1;
+      }
+    }
   }
 
-  return true;
+  dprintf("Library instrumented, writing...\n");
+  std::string modifiedFileName(outfile);
+    // Output the instrumented binary
+  if(!mutateeAddressSpace->writeFile(outfile)) {
+    printf("Failed to write output file: %s \n",  outfile );
+    return EXIT_FAILURE;
+  }
+  return 0;
 }
 
 int main(int argc, char* argv[]) {
   if(!parseArgs(argc, argv))
     return EXIT_FAILURE;
 
-  /* Initialize list of libraries that should not be instrumented - relevant
-   * only if includeSharedLib is true */
-  initSkipLibraries();
-
-  /* Open the specified binary for binary rewriting.
-   * When the second parameter is set to true, all the library dependencies
-   * as well as the binary are opened */
-
-  BPatch_binaryEdit* appBin = bpatch.openBinary(inBinary, true);
-  if(appBin == NULL) {
-    cerr << "Failed to open binary" << endl;
-    return EXIT_FAILURE;
-  }
-
-  /* Open the instrumentation library.
-   * loadLibrary loads the instrumentation library into the binary image and
-   * adds it as a new dynamic dependency in the rewritten library */
-  const char* instLibrary = "libInst.so";
-  if(!appBin->loadLibrary(instLibrary)) {
-    cerr << "Failed to open instrumentation library" << endl;
-    return EXIT_FAILURE;
-  }
-
-  BPatch_image* appImage = appBin->getImage();
-  /* Find code coverage functions in the instrumentation library */
-  BPatch_function* instInitFunc = findFuncByName(appImage, "initCoverage");
-  BPatch_function* registerFunc = findFuncByName(appImage, "registerFunc");
-  BPatch_function* instIncFunc = findFuncByName(appImage, "incFuncCoverage");
-  BPatch_function* registerBB = findFuncByName(appImage, "registerBB");
-  BPatch_function* instBBIncFunc = findFuncByName(appImage, "incBBCoverage");
-  BPatch_function* instExitFunc = findFuncByName(appImage, "exitCoverage");
-
-  if(!instInitFunc || !instIncFunc || !instExitFunc || !instBBIncFunc || !registerFunc || !registerBB) {
-    return EXIT_FAILURE;
-  }
-
-  /* To instrument every function in the binary
-   * --> iterate over all the modules in the binary
-   * --> iterate over all functions in each modules */
-
-  vector<BPatch_module*>* modules = appImage->getModules();
-  vector<BPatch_module*>::iterator moduleIter;
-
-  BPatch_Vector<BPatch_snippet*> registerCalls;
-
-  int bbIndex = 0;
-  int funcIndex = 0;
-  for(moduleIter = modules->begin(); moduleIter != modules->end(); ++moduleIter) {
-    char moduleName[1024];
-    (*moduleIter)->getName(moduleName, 1024);
-
-    /* if includeSharedLib is not set, skip instrumenting dependent libraries */
-    if((*moduleIter)->isSharedLib()) {
-      if(!includeSharedLib || skipLibraries.find(moduleName) != skipLibraries.end()) {
-        //                cout << "Skipping library: " << moduleName << endl;
-        continue;
-      }
-    }
-
-    cout << "Instrumenting module: " << moduleName << endl;
-    vector<BPatch_function*>* allFunctions = (*moduleIter)->getProcedures();
-    vector<BPatch_function*>::iterator funcIter;
-
-    /* Insert snippets at the entry of every function */
-    for(funcIter = allFunctions->begin(); funcIter != allFunctions->end(); ++funcIter) {
-      BPatch_function* curFunc = *funcIter;
-
-      char funcName[1024];
-      curFunc->getName(funcName, 1024);
-
-      /*
-       * Replace DEFAULT_MODULE with the name of the input binary in the output
-       */
-      string passedModName(moduleName);
-      if(passedModName.find("DEFAULT_MODULE") != string::npos) {
-        // Strip the directory
-        passedModName = inBinary;
-        passedModName = passedModName.substr(passedModName.find_last_of("\\/") + 1);
-      }
-
-      insertFuncEntry(appBin, curFunc, funcName, instIncFunc, funcIndex);
-
-      /* Create a call to the registration function */
-      BPatch_Vector<BPatch_snippet*> regArgs;
-      BPatch_constExpr funcIdReg(funcIndex);
-      regArgs.push_back(&funcIdReg);
-
-      /* BPatch_constExpr will internally make a deep copy of the string */
-      BPatch_constExpr coverageFunc(funcName);
-      regArgs.push_back(&coverageFunc);
-      BPatch_constExpr coverageModule(passedModName.c_str());
-      regArgs.push_back(&coverageModule);
-
-      /* BPatch_funcCallExpr will make a copy of regArgs.
-       * So, it is fine to define regArgs and BPatch_constExpr as local
-       * variables.
-       */
-      BPatch_funcCallExpr* regCall = new BPatch_funcCallExpr(*registerFunc, regArgs);
-      registerCalls.push_back(regCall);
-
-      funcIndex++;
-
-      if(bbCoverage) {
-        insertBBEntry(appBin, curFunc, funcName, passedModName.c_str(), instBBIncFunc, registerBB, &bbIndex,
-                      &registerCalls);
-      }
-    }
-  }
-
-  /* Create argument list for initCoverage function
-   * with the number of functions the number of basic blocks */
-  BPatch_Vector<BPatch_snippet*> instInitArgs;
-  BPatch_constExpr numFuncs(funcIndex);
-  instInitArgs.push_back(&numFuncs);
-  BPatch_constExpr numBBs(bbIndex);
-  instInitArgs.push_back(&numBBs);
-  BPatch_funcCallExpr instInitExpr(*instInitFunc, instInitArgs);
-
-  // Execute the function registration and basic block registration calls after
-  // the call to the initialization function, i.e.,
-  // initCoverage()
-  // registerFunc()
-  // ...
-  // registerBB()
-  // ...
-  BPatch_sequence registerSequence(registerCalls);
-
-  BPatch_Vector<BPatch_snippet*> initSequenceVec;
-  initSequenceVec.push_back(&instInitExpr);
-  initSequenceVec.push_back(&registerSequence);
-
-  BPatch_sequence initSequence(initSequenceVec);
-
-  /* Locate _init */
-  BPatch_Vector<BPatch_function*> funcs;
-  appImage->findFunction("_init", funcs);
-  if(funcs.size()) {
-    BPatch_Vector<BPatch_function*>::iterator fIter;
-    for(fIter = funcs.begin(); fIter != funcs.end(); ++fIter) {
-      BPatch_module* mod = (*fIter)->getModule();
-      char modName[1024];
-      mod->getName(modName, 1024);
-      if(!mod->isSharedLib()) {
-        mod->getObject()->insertInitCallback(initSequence);
-        cerr << "insertInitCallback on " << modName << endl;
-      }
-    }
-  }
-
-  /* Insert initCoverage function in the init section of the default module
-   * to be executed exactly once when the module is loaded */
-  //    if (!defaultModule->insertInitCallback (initSequence)) {
-  //        cerr << "Failed to insert init function in the module" << endl;
-  //        return EXIT_FAILURE;
-  //    }
-
-  /* Insert exitCoverage function in the fini section of the default module
-   * to be executed exactly once when the module is unloaded */
-  BPatch_Vector<BPatch_snippet*> instExitArgs;
-  BPatch_constExpr varPrint(printAll);
-  instExitArgs.push_back(&varPrint);
-  BPatch_constExpr varBBPrint(bbCoverage ? 1 : 0);
-  instExitArgs.push_back(&varBBPrint);
-  BPatch_constExpr varAlpha(alphabetical);
-  instExitArgs.push_back(&varAlpha);
-  BPatch_funcCallExpr instExitExpr(*instExitFunc, instExitArgs);
-
-  /* Locate _fini */
-  funcs.clear();
-  appImage->findFunction("_fini", funcs);
-  if(funcs.size()) {
-    BPatch_Vector<BPatch_function*>::iterator fIter;
-    for(fIter = funcs.begin(); fIter != funcs.end(); ++fIter) {
-      BPatch_module* mod = (*fIter)->getModule();
-      char modName[1024];
-      mod->getName(modName, 1024);
-      if(!mod->isSharedLib()) {
-        mod->getObject()->insertFiniCallback(instExitExpr);
-        cerr << "insertFiniCallback on " << modName << endl;
-      }
-    }
-  }
-
-  //    if (!defaultModule->insertFiniCallback (instExitExpr)) {
-  //        cerr << "Failed to insert exit function in the module" << endl;
-  //        return EXIT_FAILURE;
-  //    }
-
-  // Output the instrumented binary
-  if(!appBin->writeFile(outBinary)) {
-    cerr << "Failed to write output file: " << outBinary << endl;
-    return EXIT_FAILURE;
-  }
-
-  return EXIT_SUCCESS;
+  bpatch = new BPatch;                           //create a new version. 
+  return tauRewriteLibrary(bpatch);;
 }

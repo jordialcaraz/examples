@@ -23,3 +23,8 @@ Each example is built in its own subdirectory under the main build directory (if
 	$ export LD_LIBRARY_PATH=.:path/to/dyninst/lib:$LD_LIBRARY_PATH
 	$ ./code_coverage -p testcc testcc.inst
 	$ ./testcc.inst
+
+## Issue with codeCoverage
+
+$ cd codeCoverage
+$ ./code_coverage -s lib_to_instrument/libtorch_python.so libtorch_python.so

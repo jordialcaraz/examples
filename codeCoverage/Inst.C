@@ -170,3 +170,13 @@ void exitCoverage(int printAll, int printBasicBlocks, int sortAlphabetical) {
 
   enabled = 0;
 }
+
+void FEntryCoverage(const char * func_name)
+{
+  printf("FEntryCoverage, function : %s\n", func_name);
+}
+
+void FExitCoverage(const char * func_name)
+{
+  printf("FExitCoverage, function : %s\n", func_name);
+}
